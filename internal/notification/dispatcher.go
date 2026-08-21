@@ -19,8 +19,9 @@ type DispatchResult struct {
 }
 
 type Dispatcher struct {
-	Senders     map[Channel]Sender
-	Concurrency int
+	Senders       map[Channel]Sender
+	Concurrency   int
+	ContextPolicy DispatchContextPolicy
 }
 
 func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveries []Delivery) ([]DispatchResult, error) {
@@ -34,6 +35,11 @@ func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveri
 	if concurrency > 32 {
 		concurrency = 32
 	}
+	dispatchCtx, cancelDispatch, _, err := dispatchContext(ctx, dispatcher.ContextPolicy)
+	if err != nil {
+		return nil, err
+	}
+	defer cancelDispatch()
 	results := make([]DispatchResult, len(deliveries))
 	jobs := make(chan int)
 	var group sync.WaitGroup
@@ -47,7 +53,7 @@ func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveri
 				sender := dispatcher.Senders[delivery.Channel]
 				if sender == nil {
 					result.Error = fmt.Errorf("no sender for channel %s", delivery.Channel)
-				} else if err := sender.Send(ctx, delivery, event); err != nil {
+				} else if err := sender.Send(dispatchCtx, delivery, event); err != nil {
 					result.Error = err
 				} else {
 					result.Sent = true
@@ -59,13 +65,13 @@ func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveri
 	for index := range deliveries {
 		select {
 		case jobs <- index:
-		case <-ctx.Done():
+		case <-dispatchCtx.Done():
 			close(jobs)
 			group.Wait()
 			for remaining := index; remaining < len(deliveries); remaining++ {
-				results[remaining] = DispatchResult{Delivery: deliveries[remaining], Error: ctx.Err()}
+				results[remaining] = DispatchResult{Delivery: deliveries[remaining], Error: dispatchCtx.Err()}
 			}
-			return results, ctx.Err()
+			return results, dispatchCtx.Err()
 		}
 	}
 	close(jobs)
