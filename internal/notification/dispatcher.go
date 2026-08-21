@@ -48,12 +48,20 @@ func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveri
 		go func() {
 			defer group.Done()
 			for index := range jobs {
-				delivery := deliveries[index]
-				result := DispatchResult{Delivery: delivery}
-				sender := dispatcher.Senders[delivery.Channel]
+				result := DispatchResult{Delivery: deliveries[index]}
+				// Re-check before sending: if the dispatch was cancelled while
+				// this job was queued, never start the send so it cannot hold a
+				// connection. Sends already in flight return promptly because
+				// they share the cancelled dispatch context.
+				if err := dispatchCtx.Err(); err != nil {
+					result.Error = err
+					results[index] = result
+					continue
+				}
+				sender := dispatcher.Senders[deliveries[index].Channel]
 				if sender == nil {
-					result.Error = fmt.Errorf("no sender for channel %s", delivery.Channel)
-				} else if err := sender.Send(dispatchCtx, delivery, event); err != nil {
+					result.Error = fmt.Errorf("no sender for channel %s", deliveries[index].Channel)
+				} else if err := sender.Send(dispatchCtx, deliveries[index], event); err != nil {
 					result.Error = err
 				} else {
 					result.Sent = true
@@ -62,20 +70,37 @@ func (dispatcher Dispatcher) Dispatch(ctx context.Context, event Event, deliveri
 			}
 		}()
 	}
+	// Feed deliveries in submission order, but stop the moment the dispatch
+	// context is cancelled so notifications that have not been scheduled yet
+	// never start. `fed` tracks how many were actually handed to a worker.
+	fed := 0
+feed:
 	for index := range deliveries {
 		select {
 		case jobs <- index:
+			fed = index + 1
 		case <-dispatchCtx.Done():
-			close(jobs)
-			group.Wait()
-			for remaining := index; remaining < len(deliveries); remaining++ {
-				results[remaining] = DispatchResult{Delivery: deliveries[remaining], Error: dispatchCtx.Err()}
-			}
-			return results, dispatchCtx.Err()
+			break feed
 		}
 	}
 	close(jobs)
 	group.Wait()
+	if err := dispatchCtx.Err(); err != nil {
+		// Fill every delivery that was never scheduled, preserving the original
+		// delivery order in the returned results.
+		for remaining := fed; remaining < len(deliveries); remaining++ {
+			results[remaining] = DispatchResult{Delivery: deliveries[remaining], Error: err}
+		}
+		// If cancellation arrived after every delivery had already been sent,
+		// nothing was interrupted: report success so normal notifications are
+		// unaffected by a late cancellation.
+		for _, result := range results {
+			if !result.Sent {
+				return results, err
+			}
+		}
+		return results, nil
+	}
 	return results, nil
 }
 

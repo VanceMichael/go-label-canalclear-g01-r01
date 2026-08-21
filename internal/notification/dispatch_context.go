@@ -42,7 +42,11 @@ func (policy DispatchContextPolicy) Derive(parent context.Context, now time.Time
 	}
 	base := context.Background()
 	if policy.PreserveValues {
-		base = context.WithoutCancel(parent)
+		// Inherit the parent's values AND its cancellation chain so a caller
+		// cancellation stops in-flight sends and prevents unscheduled
+		// deliveries from starting. The deadline below bounds the dispatch
+		// when the parent has no deadline of its own.
+		base = parent
 	}
 	deadline := now.Add(policy.MaximumDuration)
 	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
